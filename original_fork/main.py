@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
-import cardData
-import utils
+import original_fork.cardData as cardData
+import original_fork.utils as utils
 
 
 def readCard():

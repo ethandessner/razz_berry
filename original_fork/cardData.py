@@ -1,7 +1,7 @@
 import mysql.connector
-import cardSet
-import pokedex
-import evolutionsSet
+import original_fork.cardSet as cardSet
+import original_fork.pokedex as pokedex
+import original_fork.evolutionsSet as evolutionsSet
 import imagehash
 import numpy as np
 

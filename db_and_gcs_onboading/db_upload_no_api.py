@@ -340,7 +340,7 @@ class App(tk.Tk):
         self.geometry("860x640"); self.resizable(False, False)
 
         self.logo_img = None  # keep a ref on the instance so Tk doesn't GC it
-        RAZZ_ICON_PATH = "/Users/ethandessner/dev/Pokemon-Card-Scanner/razz_iso.png"  # transparent PNG/GIF
+        RAZZ_ICON_PATH = "/Users/ethandessner/dev/Pokemon-Card-Scanner/images/razz_iso.png"  # transparent PNG/GIF
         try:
             self.logo_img = tk.PhotoImage(master=self, file=RAZZ_ICON_PATH)
             # Optional (Windows/Linux): show in titlebar/taskbar too

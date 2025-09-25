@@ -3,7 +3,7 @@ import numpy as np
 import math
 from PIL import Image
 import imagehash
-import cardData
+import original_fork.cardData as cardData
 
 
 # Get the width of the cards/images

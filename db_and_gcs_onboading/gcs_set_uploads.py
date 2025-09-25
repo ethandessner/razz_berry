@@ -316,7 +316,7 @@ class App(tk.Tk):
         self.logo_img = None
 
         # 1) Load the berry image (PNG/GIF) and keep a reference on the instance
-        RAZZ_ICON_PATH = "/Users/ethandessner/dev/Pokemon-Card-Scanner/razz_iso.png"
+        RAZZ_ICON_PATH = "/Users/ethandessner/dev/Pokemon-Card-Scanner/images/razz_iso.png"
         try:
             self.logo_img = tk.PhotoImage(master=self, file=RAZZ_ICON_PATH)
         except Exception as e:

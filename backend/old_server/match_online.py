@@ -2,7 +2,6 @@ import os, io, ssl, certifi, urllib.request
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
-# --- TLS bootstrap for macOS/ssl issues ---
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
