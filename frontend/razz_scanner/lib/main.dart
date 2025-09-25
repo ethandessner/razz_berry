@@ -9,12 +9,12 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'dart:ui' show FontFeature;
 
-/// CHANGE THIS to your laptop's LAN IP/port where FastAPI runs
-const String matcherBaseUrl = 'http://192.168.1.69:8000';
+final String matcherBaseUrl = dotenv.env['MATCHER_BASE_URL'] ?? '';
 
-// Ensures GCS links are fetchable by the phone (viewer → public CDN)
+// Ensures GCS links are fetchable by the phone
 String _gcsToDownloadUrl(String url) {
   const viewer = 'https://storage.cloud.google.com/';
   if (url.startsWith(viewer)) {
@@ -26,6 +26,7 @@ String _gcsToDownloadUrl(String url) {
 }
 
 Future<void> main() async {
+  await dotenv.load();
   WidgetsFlutterBinding.ensureInitialized();
   final cameras = await availableCameras();
   final back = cameras.firstWhere(
@@ -159,7 +160,7 @@ class _HomeState extends State<Home> {
   }) async {
     final uri = Uri.parse('$matcherBaseUrl/match');
     final req = http.MultipartRequest('POST', uri)
-      ..fields['strategy'] = 'auto' // backend will auto-segment; extra fields are ignored if unused
+      ..fields['strategy'] = 'auto' // backend will auto-segment - extra fields are ignored if unused
       ..fields['top_k'] = '5'
       ..fields['cutoff'] = '18'
       ..files.add(http.MultipartFile.fromBytes(

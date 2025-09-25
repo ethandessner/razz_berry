@@ -17,7 +17,7 @@ def preprocess_for_hash(img_pil: Image.Image, max_side: int = 900) -> Image.Imag
     if scale < 1.0:
         img_pil = img_pil.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
 
-    # Trim 3.5% border to reduce sleeve/background effects
+    # Trim 3.5% border to reduce sleeve/background effects - needs to be FIXED
     dx = int(img_pil.width * 0.035)
     dy = int(img_pil.height * 0.035)
     img_pil = img_pil.crop((dx, dy, img_pil.width - dx, img_pil.height - dy))
@@ -31,7 +31,7 @@ def preprocess_for_hash(img_pil: Image.Image, max_side: int = 900) -> Image.Imag
     return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 def compute_hashes_pil(img: Image.Image) -> Tuple[imagehash.ImageHash, imagehash.ImageHash, imagehash.ImageHash, imagehash.ImageHash]:
-    # IMPORTANT: default hash_size=8 to match what you stored in Supabase
+    # IMPORTANT: default hash_size=8 to match what you stored in Supabase - increase this to 16 later
     return (
         imagehash.average_hash(img),
         imagehash.whash(img),

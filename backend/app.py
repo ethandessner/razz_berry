@@ -10,7 +10,6 @@ urllib.request.install_opener(
     urllib.request.build_opener(urllib.request.HTTPSHandler(context=_SSL_CTX))
 )
 
-# ---- Third-party ----
 from fastapi import FastAPI, File, UploadFile, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -430,7 +429,7 @@ async def ws_debug(ws: WebSocket):
 @app.post("/match")
 async def match(
     file: UploadFile = File(...),
-    strategy: str = Form("auto"),         # always auto-segment (model-style)
+    strategy: str = Form("auto"),         # always auto-segment
     top_k: int = Form(TOPK_DEFAULT),
     cutoff: int = Form(CUTOFF),
 ):
@@ -439,12 +438,12 @@ async def match(
         img_pil = Image.open(io.BytesIO(raw))
         img_pil = ImageOps.exif_transpose(img_pil).convert("RGB")
 
-        # 1) Segment like the original demo (clean edges + quad)
+        # Segment and warp
         bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
         warped, overlay, edges, thr, quad = segment_card_like_model(bgr)
 
         if warped is None:
-            # Send a montage so /monitor shows what happened
+            # Send to monitor
             montage_jpg = _make_montage_jpg(bgr, overlay, edges, thr, None, None)
             await broadcast_debug({
                 "jpg_b64": montage_jpg,
@@ -460,11 +459,11 @@ async def match(
                 "error": "no_card_detected"
             }
 
-        # 2) Hash the warped card using the SAME normalization as your DB
+        # Hash the warped card using the SAME normalization as DB
         scan_img = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
         cap_hashes = compute_hashes_pil(scan_img)  # compute_hashes_pil calls prepare_card_for_hash
 
-        # 3) Score against all rows (max-of-mins across orientations/methods)
+        # Score against all rows (max-of-mins across orientations/methods)
         scored = []
         for r in CARDS:
             s = score_max_of_mins(cap_hashes, r)
@@ -486,7 +485,7 @@ async def match(
         is_confident = bool(best and best_score is not None and best_score < cutoff)
         confidence = score_to_confidence(best_score, cutoff) if best_score is not None else 0.0
 
-        # 4) Push live montage to /monitor
+        # Push live montage to /monitor
         montage_jpg = _make_montage_jpg(bgr, overlay, edges, thr, warped, best)
         await broadcast_debug({
             "jpg_b64": montage_jpg,
@@ -497,7 +496,7 @@ async def match(
             "confidence": confidence,
         })
 
-        # 5) Response for the app
+        # Response for the app
         return {
             "match": (best if is_confident else None),
             "best": best,
@@ -511,7 +510,7 @@ async def match(
         }
 
     except Exception as e:
-        # Return 200 with an error payload so the app can show a toast instead of failing hard
+        # Return 200 with an error payload so the app can show a toast instead of just failing
         return JSONResponse(status_code=200, content={
             "match": None, "best": None, "top": [],
             "cutoff": cutoff, "count": len(CARDS),
@@ -548,8 +547,7 @@ def _make_montage_jpg(orig_bgr, overlay_bgr, edges, thr, warped_bgr, best):
         row2 = cv2.hconcat([row2, pad])
     grid = cv2.vconcat([row1, row2])
 
-    # annotate
-    text = "Razz Monitor"
+    text = "Razz Berry Monitor"
     if best:
         text += f"  |  Best: {best.get('name','')}  score {best.get('score')}"
     cv2.rectangle(grid, (0,0), (grid.shape[1], 30), (32,32,32), -1)

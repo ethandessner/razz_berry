@@ -2,10 +2,10 @@ import numpy as np
 import cv2
 from typing import Optional, Tuple
 
-# Match the model project’s “card image size”
+# card image size
 CARD_W, CARD_H = 330, 440  # (width, height)
 
-# Biggest-quad filters (loose; the model code was simple area>5000 + approxPolyDP==4)
+# Biggest-quad filter
 MIN_AREA = 5000
 
 def biggestContour_model(contours):
@@ -43,7 +43,7 @@ def reorderCorners_model(corners):
     for i in range(len(idxs)):
         xvals[i] = temp[idxs[i]]
 
-    # normalize order to “top-left first”
+    # normalize order to top-left first
     if yvals[0] == yvals[1] and xvals[1] < xvals[0]:
         xvals[0], xvals[1] = xvals[1], xvals[0]
 
@@ -56,7 +56,8 @@ def reorderCorners_model(corners):
     idxsDist.insert(0, 0)
     idxsDist[1] += 1; idxsDist[2] += 1; idxsDist[3] += 1
 
-    # tilt handling (same as model utils)
+    # tilt handling 
+    # also random note - the crobat card does better when captured at a slight tilt
     if yvals[0] == yvals[1]:
         if dists[0] == dSorted[0]:
             topleft    = [xvals[idxsDist[0]], yvals[idxsDist[0]]]
@@ -127,7 +128,7 @@ def segment_card_model(bgr_image: np.ndarray):
     return warped, gray, blur, edges, bigContour
 
 def _label(img, text):
-    # white band on top + black label (like model)
+    # white band on top and black label
     h, w = img.shape[:2]
     bar = np.full((32, w, 3), 255, np.uint8)
     out = np.vstack([bar, img if img.ndim==3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)])
