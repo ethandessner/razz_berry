@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+pillow
+ImageHash
+opencv-python-headless
+numpy
+supabase
+postgrest
+python-dotenv

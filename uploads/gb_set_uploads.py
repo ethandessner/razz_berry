@@ -150,7 +150,6 @@ async def process_csv_for_set(sdk, csv_path: str, api_set_id: str, set_name_for_
             variants = variant_map[card_id]
             try:
                 card = await sdk.card.get(card_id)
-                
                 ext_number = card_id_to_extNumber.get(card_id, "Unknown")
                 card_name = card_id_to_cardName.get(card_id, "Unknown")
                 if ' - ' in card_name:

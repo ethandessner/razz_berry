@@ -2,9 +2,12 @@ import os, sys, ssl, certifi, urllib.request, re, asyncio, aiohttp, aiofiles
 import threading, queue
 from typing import Dict, List, Optional, Callable
 
+import cv2
+import numpy as np
 import pandas as pd
 from PIL import Image
 import imagehash
+import tempfile
 
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -25,7 +28,7 @@ urllib.request.install_opener(
 # ================== CONFIG ==================
 CSV_FOLDER = "/Users/ethandessner/Desktop/PokemonCSVs"
 GCS_BUCKET_NAME = "razz_berry"
-TABLE_NAME = "destined"
+TABLE_NAME = "destinedrivals"
 UPSERT_ON_CONFLICT = "card_id,subtype_name"
 VERIFY_GCS = True          # HEAD/GET check the GCS URL before hashing
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
@@ -38,6 +41,33 @@ csv_to_api_set_id = {
 }
 
 # ---- helpers ----
+
+def prepare_card_for_hash(img_pil: Image.Image, max_side: int = 900) -> Image.Image:
+    """Same normalization for DB and live: trim border, CLAHE on luma, mild denoise, area resample."""
+    bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+    # trim 3.5% uniform border (sleeves/edge lighting)
+    h, w = bgr.shape[:2]
+    dx = int(w * 0.035); dy = int(h * 0.035)
+    bgr = bgr[dy:h-dy, dx:w-dx].copy()
+
+    # CLAHE on luminance only
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+    y = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(y)
+    bgr = cv2.cvtColor(cv2.merge([y, cr, cb]), cv2.COLOR_YCrCb2BGR)
+
+    # mild edge-preserving denoise
+    bgr = cv2.bilateralFilter(bgr, 5, 60, 60)
+
+    # downscale (if needed) with INTER_AREA (best for shrink)
+    h, w = bgr.shape[:2]
+    scale = float(max_side) / max(h, w)
+    if scale < 1.0:
+        bgr = cv2.resize(bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+
+    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
 def load_backup_image_lookup(csv_path: str) -> Dict[str, str]:
     df = pd.read_csv(csv_path)
     lookup = {}
@@ -49,36 +79,57 @@ def load_backup_image_lookup(csv_path: str) -> Dict[str, str]:
             lookup[name] = url
     return lookup
 
-def build_gcs_url(set_name: str, card_id: str, variant_flag: str) -> str:
+def gcs_object_path(set_name: str, card_id: str, variant_flag: str) -> str:
     safe_variant = variant_flag.replace(' ', '_').lower()
     filename = f"{card_id}_{safe_variant}.png"
-    return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{set_name}/{filename}"
+    return f"{set_name}/{filename}"
+
+def build_gcs_view_url(obj_path: str) -> str:
+    # human viewer (your required DB format) — may require auth in browsers
+    return f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/{obj_path}"
+
+def build_gcs_download_url(obj_path: str) -> str:
+    # programmatic/public fetch; works with curl/aiohttp if object is public
+    return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{obj_path}"
+
 
 def compute_model_hashes_from_file(path: str) -> Dict[str, str]:
     img = Image.open(path).convert("RGB")
+    img = prepare_card_for_hash(img, max_side=900)   # <<< same as matcher
     def hset(i):
         return {
-            "avghashes": str(imagehash.average_hash(i)),
-            "whashes":   str(imagehash.whash(i)),
-            "phashes":   str(imagehash.phash(i)),
-            "dhashes":   str(imagehash.dhash(i)),
+            "avghashes": str(imagehash.average_hash(i, hash_size=8)),
+            "whashes":   str(imagehash.whash(i, hash_size=8)),
+            "phashes":   str(imagehash.phash(i, hash_size=8)),
+            "dhashes":   str(imagehash.dhash(i, hash_size=8)),
         }
     out = {}
-    out.update(hset(img))  # normal
-    m = img.transpose(Image.FLIP_LEFT_RIGHT)
-    out.update({k+"mir": v for k, v in hset(m).items()})
+    out.update(hset(img))
+    m  = img.transpose(Image.FLIP_LEFT_RIGHT)
     ud = img.transpose(Image.ROTATE_180)
-    out.update({k+"ud": v for k, v in hset(ud).items()})
-    udm = ud.transpose(Image.FLIP_LEFT_RIGHT)
-    out.update({k+"udmir": v for k, v in hset(udm).items()})
+    um = ud.transpose(Image.FLIP_LEFT_RIGHT)
+    out.update({k+"mir":   v for k, v in hset(m ).items()})
+    out.update({k+"ud":    v for k, v in hset(ud).items()})
+    out.update({k+"udmir": v for k, v in hset(um).items()})
     return out
 
 async def head_exists(session: aiohttp.ClientSession, url: str) -> bool:
     try:
-        async with session.get(url, headers=IMG_HEADERS) as resp:
-            return resp.status == 200
+        async with session.get(url, headers=IMG_HEADERS, allow_redirects=True) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            return resp.status == 200 and ctype.startswith("image/")
     except Exception:
         return False
+
+async def fetch_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
+    try:
+        async with session.get(url, headers=IMG_HEADERS, allow_redirects=True) as resp:
+            if resp.status == 200 and resp.headers.get("Content-Type","").startswith("image/"):
+                return await resp.read()
+    except Exception:
+        pass
+    return None
+
 
 def parse_prefix(num_str: str):
     """Return (letters, digits) for an extNumber numerator like '004' or 'BW4'."""
@@ -109,7 +160,10 @@ async def infer_card_formatter_from_gcs(
         for letters, digits in samples:
             num = f"{letters}{str(int(digits)).zfill(pad)}" if digits.isdigit() else f"{letters}{digits}"
             card_id = f"{api_set_id}-{num}"
-            test_url = build_gcs_url(set_name, card_id, "normal")  # any variant name; just checking existence
+
+            obj_path = gcs_object_path(set_name, card_id, "normal")
+            test_url = build_gcs_download_url(obj_path)
+
             if await head_exists(session, test_url):
                 return lambda d: f"{api_set_id}-{ (f'{int(d)}'.zfill(pad) if d.isdigit() else d) }"
 
@@ -117,15 +171,6 @@ async def infer_card_formatter_from_gcs(
     has_letters = any(l for l, _ in samples)
     pad = 2 if has_letters else 3
     return lambda d: f"{api_set_id}-{ (f'{int(d)}'.zfill(pad) if d.isdigit() else d) }"
-
-async def fetch_bytes(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
-    try:
-        async with session.get(url, headers=IMG_HEADERS) as resp:
-            if resp.status == 200:
-                return await resp.read()
-    except Exception:
-        pass
-    return None
 
 async def process_set_to_supabase_noapi(
     supabase: Client, set_name: str, api_set_id: str, csv_path: str
@@ -187,31 +232,39 @@ async def process_set_to_supabase_noapi(
 
             for variant in sorted(variant_map[card_id]):
                 # 1) persistent image_path we store in DB (always your GCS URL)
-                image_path = build_gcs_url(set_name, card_id, variant)
+                obj_path   = gcs_object_path(set_name, card_id, variant)
+                # image_path = build_gcs_view_url(obj_path)          # what you store in Supabase
+                image_path = build_gcs_download_url(obj_path)
 
-                # 2) pick a URL to HASH from (prefer GCS; fallback to CSV backup)
-                chosen_for_hash = image_path
+                url_for_fetch = build_gcs_download_url(obj_path)   # what we GET for hashing
+
+
+
+                chosen_for_hash = url_for_fetch
                 if VERIFY_GCS:
-                    ok = await head_exists(session, image_path)
+                    ok = await head_exists(session, url_for_fetch)
                     if not ok:
                         fallback = backup_image_lookup.get(display_name)
                         if fallback:
                             chosen_for_hash = fallback
 
-                # 3) download image and compute hashes (all 16 required)
                 img_bytes = await fetch_bytes(session, chosen_for_hash)
                 if not img_bytes:
                     print(f"Skip (no image available to hash): {card_id} {variant}")
                     continue
 
-                tmp = os.path.join("/tmp", f"{card_id}_{variant}.png")
-                async with aiofiles.open(tmp, "wb") as f:
-                    await f.write(img_bytes)
+                tmp_path = None
                 try:
-                    hashes = compute_model_hashes_from_file(tmp)
+                    # create a secure temp file and write bytes
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tf:
+                        tmp_path = tf.name
+                        tf.write(img_bytes)
+                    hashes = compute_model_hashes_from_file(tmp_path)
                 finally:
-                    try: os.remove(tmp)
-                    except Exception: pass
+                    if tmp_path and os.path.exists(tmp_path):
+                        try: os.remove(tmp_path)
+                        except Exception: pass
+
 
                 rec = {
                     "card_id": card_id,
