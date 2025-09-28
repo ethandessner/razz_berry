@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+supabase
+python-dotenv
+Pillow
+requests
+numpy
+scikit-learn
+httpx
+google-cloud-aiplatform

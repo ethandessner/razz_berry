@@ -7,14 +7,10 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import imagehash
-import base64, io, json
 import tempfile
 
 from supabase import create_client, Client
 from dotenv import load_dotenv
-
-# Load environment early so Vertex/Supabase config picks it up before constants are defined
-load_dotenv()
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -37,12 +33,6 @@ UPSERT_ON_CONFLICT = "card_id,subtype_name"
 VERIFY_GCS = True          # HEAD/GET check the GCS URL before hashing
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 IMG_HEADERS = {"User-Agent": "RazzBerryOnboarder/1.0", "Accept": "image/png,image/*;q=0.8,*/*;q=0.5"}
-# Embedding options (embeddings ALWAYS attempted if Vertex config present)
-EMBEDDINGS_COLUMN = os.getenv("EMBEDDINGS_COLUMN", "embedding_vec")
-VERTEX_PROJECT_ID = os.getenv("VERTEX_PROJECT_ID", "").strip()
-VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1").strip()
-VERTEX_EMBED_MODEL = os.getenv("VERTEX_EMBED_MODEL", "multimodalembedding@001").strip()
-_vertex_client = None
 # ============================================
 
 # Map set folder name → api_set_id prefix (used to build card_id)
@@ -123,47 +113,6 @@ def compute_model_hashes_from_file(path: str) -> Dict[str, str]:
     out.update({k+"udmir": v for k, v in hset(um).items()})
     return out
 
-# -------- Embedding (optional) --------
-def _init_vertex():
-    global _vertex_client
-    if _vertex_client is not None:
-        return
-    try:
-        from google.cloud import aiplatform
-        from google.cloud.aiplatform.gapic import PredictionServiceClient
-        aiplatform.init(project=VERTEX_PROJECT_ID, location=VERTEX_LOCATION)
-        _vertex_client = PredictionServiceClient()
-    except Exception as e:
-        print(f"[embeddings] INIT FAILED: {e}")
-        _vertex_client = False  # sentinel to avoid retry spam
-
-def _embed_image_bytes(jpeg_bytes: bytes):
-    if not VERTEX_PROJECT_ID:
-        return None
-    if _vertex_client is False:
-        return None
-    if _vertex_client is None:
-        _init_vertex()
-    if not _vertex_client or _vertex_client is False:
-        return None
-    b64 = base64.b64encode(jpeg_bytes).decode()
-    endpoint = f"projects/{VERTEX_PROJECT_ID}/locations/{VERTEX_LOCATION}/publishers/google/models/{VERTEX_EMBED_MODEL}"
-    inst = {"image": {"bytesBase64Encoded": b64}}
-    try:
-        resp = _vertex_client.predict(endpoint=endpoint, instances=[inst], parameters={})
-        pred = resp.predictions[0]
-        if hasattr(pred, 'get'):
-            embed = pred.get('imageEmbedding') or pred.get('embedding')
-        else:
-            embed = pred['imageEmbedding'] if 'imageEmbedding' in pred else pred['embedding']
-        vec = list(map(float, embed))
-        norm = np.linalg.norm(vec) or 1.0
-        vec = [float(x / norm) for x in vec]
-        return vec
-    except Exception as e:
-        print(f"[embeddings] predict failed: {e}")
-        return None
-
 async def head_exists(session: aiohttp.ClientSession, url: str) -> bool:
     try:
         async with session.get(url, headers=IMG_HEADERS, allow_redirects=True) as resp:
@@ -227,14 +176,6 @@ async def process_set_to_supabase_noapi(
     supabase: Client, set_name: str, api_set_id: str, csv_path: str
 ):
     print(f"\n==== Onboarding (no API): {set_name} ({api_set_id}) ====")
-    if VERTEX_PROJECT_ID:
-        # Ensure Vertex initialized once early
-        _init_vertex()
-        if _vertex_client is False:
-            print("[embeddings] Vertex init failed (see earlier error) — embeddings will be skipped.")
-        print(f"Embedding config: project={VERTEX_PROJECT_ID} location={VERTEX_LOCATION} model={VERTEX_EMBED_MODEL}")
-    else:
-        print("Embedding config: VERTEX_PROJECT_ID missing -> embeddings will be skipped.")
     df = pd.read_csv(csv_path)
 
     # canonicalize variants from CSV subtype
@@ -282,12 +223,8 @@ async def process_set_to_supabase_noapi(
         # fallback image lookup from CSV TCGplayer column, for hashing only
         backup_image_lookup = load_backup_image_lookup(csv_path)
 
-
         batch: List[dict] = []
         BATCH = 80
-        embed_attempts = 0
-        embed_success = 0
-        embed_fail = 0
 
         for card_id in sorted(variant_map.keys()):
             display_name = card_id_to_name.get(card_id, "Unknown")
@@ -300,6 +237,8 @@ async def process_set_to_supabase_noapi(
                 image_path = build_gcs_download_url(obj_path)
 
                 url_for_fetch = build_gcs_download_url(obj_path)   # what we GET for hashing
+
+
 
                 chosen_for_hash = url_for_fetch
                 if VERIFY_GCS:
@@ -321,25 +260,11 @@ async def process_set_to_supabase_noapi(
                         tmp_path = tf.name
                         tf.write(img_bytes)
                     hashes = compute_model_hashes_from_file(tmp_path)
-                    # Embedding: reuse existing bytes but compress to JPEG for size (optional)
-                    emb_vec = None
-                    if VERTEX_PROJECT_ID:
-                        try:
-                            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                            jbuf = io.BytesIO(); pil_img.save(jbuf, format="JPEG", quality=90)
-                            embed_attempts += 1
-                            emb_vec = _embed_image_bytes(jbuf.getvalue())
-                            if emb_vec:
-                                embed_success += 1
-                            else:
-                                embed_fail += 1
-                        except Exception as e:
-                            embed_fail += 1
-                            print(f"[embeddings] error for {card_id} {variant}: {e}")
                 finally:
                     if tmp_path and os.path.exists(tmp_path):
                         try: os.remove(tmp_path)
                         except Exception: pass
+
 
                 rec = {
                     "card_id": card_id,
@@ -368,7 +293,6 @@ async def process_set_to_supabase_noapi(
                     "dhashesmir":    hashes["dhashesmir"],
                     "dhashesud":     hashes["dhashesud"],
                     "dhashesudmir":  hashes["dhashesudmir"],
-                    **({EMBEDDINGS_COLUMN: emb_vec} if emb_vec else {}),
                 }
                 batch.append(rec)
 
@@ -386,8 +310,6 @@ async def process_set_to_supabase_noapi(
                 print(f"Upserted {len(batch)} rows.")
             except Exception as e:
                 print("Supabase upsert error:", e)
-
-        print(f"Embedding summary: attempts={embed_attempts} success={embed_success} fail={embed_fail}")
 
 # --------- Razz theme ---------
 RZ_DARK  = "#56362d"; RZ_MED = "#285838"; RZ_LIGHT = "#f08828"; RZ_PALE = "#efeecc"
@@ -421,6 +343,9 @@ class App(tk.Tk):
         RAZZ_ICON_PATH = "/Users/ethandessner/dev/Pokemon-Card-Scanner/images/razz_iso.png"  # transparent PNG/GIF
         try:
             self.logo_img = tk.PhotoImage(master=self, file=RAZZ_ICON_PATH)
+            # Optional (Windows/Linux): show in titlebar/taskbar too
+            if sys.platform != "darwin":
+                self.iconphoto(True, self.logo_img)
         except Exception as e:
             print("logo load failed:", e)
 
@@ -441,13 +366,13 @@ class App(tk.Tk):
         ttk.Label(self.screen, text=f"CSV: {CSV_FOLDER}", style="GB.TLabel").grid(row=1, column=0, sticky="w")
         ttk.Label(self.screen, text=f"GCS Bucket: {GCS_BUCKET_NAME}", style="GB.TLabel").grid(row=1, column=1, columnspan=2, sticky="w")
 
-        # .env already loaded at module import; still allow environment override here
+        load_dotenv()
         url = os.getenv("SUPABASE_URL", "").strip()
         key = os.getenv("SUPABASE_KEY", "").strip()
         if not url or not key:
             messagebox.showwarning("Supabase", "Set SUPABASE_URL and SUPABASE_KEY in your environment/.env")
         try:
-            self.supabase = create_client(url, key) if (url and key) else None
+            self.supabase: Optional[Client] = create_client(url, key) if (url and key) else None
         except Exception as e:
             self.supabase = None; messagebox.showerror("Supabase", f"Failed to init: {e}")
 
