@@ -1,5 +1,8 @@
 import os, sys, ssl, certifi, urllib.request, re, asyncio, aiohttp, aiofiles
+# Embeddings now use Vertex AI (google-cloud-aiplatform) multimodalembedding@001 model (working path).
+# Requirements: add `google-cloud-aiplatform` to requirements.txt (legacy still supported by Google) plus pandas etc.
 import threading, queue
+import io, tempfile, math
 from typing import Dict, List, Optional, Callable
 
 import cv2
@@ -37,13 +40,23 @@ UPSERT_ON_CONFLICT = "card_id,subtype_name"
 VERIFY_GCS = True          # HEAD/GET check the GCS URL before hashing
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 IMG_HEADERS = {"User-Agent": "RazzBerryOnboarder/1.0", "Accept": "image/png,image/*;q=0.8,*/*;q=0.5"}
-# Embedding options (embeddings ALWAYS attempted if Vertex config present)
+# Embedding options (Vertex multimodal model)
 EMBEDDINGS_COLUMN = os.getenv("EMBEDDINGS_COLUMN", "embedding_vec")
-VERTEX_PROJECT_ID = os.getenv("VERTEX_PROJECT_ID", "").strip()
-VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1").strip()
 VERTEX_EMBED_MODEL = os.getenv("VERTEX_EMBED_MODEL", "multimodalembedding@001").strip()
-_vertex_client = None
+VERTEX_EMBED_DIM = int(os.getenv("VERTEX_EMBED_DIM", "1408"))  # full dim default
+VERTEX_PROJECT_ID = os.getenv("VERTEX_PROJECT_ID", "cardconnect-ethandessner").strip()
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1").strip()
+_vertex_model = None
+_suppress_embeddings = False
 # ============================================
+
+# Credential setup:
+#   Vertex mode: export VERTEX_PROJECT_ID (and optional VERTEX_LOCATION) with ADC (service account / gcloud auth)
+#   API key mode: export GOOGLE_API_KEY (preferred) or GENAI_API_KEY
+# Credential setup (choose ONE):
+#   1) API key mode: export GOOGLE_API_KEY=... (simplest)
+#   2) Vertex project mode (ADC/service account): export VERTEX_PROJECT_ID (+ optional VERTEX_LOCATION)
+# If both provided we attempt Vertex resource name first, then plain model id.
 
 # Map set folder name → api_set_id prefix (used to build card_id)
 csv_to_api_set_id = {
@@ -123,45 +136,60 @@ def compute_model_hashes_from_file(path: str) -> Dict[str, str]:
     out.update({k+"udmir": v for k, v in hset(um).items()})
     return out
 
-# -------- Embedding (optional) --------
-def _init_vertex():
-    global _vertex_client
-    if _vertex_client is not None:
+# -------- Embedding (GenAI SDK) --------
+def _init_vertex_model():
+    """Initialize Vertex multimodal embedding model once."""
+    global _vertex_model
+    if _vertex_model is not None:
         return
     try:
-        from google.cloud import aiplatform
-        from google.cloud.aiplatform.gapic import PredictionServiceClient
-        aiplatform.init(project=VERTEX_PROJECT_ID, location=VERTEX_LOCATION)
-        _vertex_client = PredictionServiceClient()
+        import vertexai  # type: ignore
+        from vertexai.vision_models import MultiModalEmbeddingModel  # type: ignore
     except Exception as e:
-        print(f"[embeddings] INIT FAILED: {e}")
-        _vertex_client = False  # sentinel to avoid retry spam
-
-def _embed_image_bytes(jpeg_bytes: bytes):
+        print(f"[embeddings] vertex import failed: {e}. Install google-cloud-aiplatform")
+        _vertex_model = False
+        return
     if not VERTEX_PROJECT_ID:
-        return None
-    if _vertex_client is False:
-        return None
-    if _vertex_client is None:
-        _init_vertex()
-    if not _vertex_client or _vertex_client is False:
-        return None
-    b64 = base64.b64encode(jpeg_bytes).decode()
-    endpoint = f"projects/{VERTEX_PROJECT_ID}/locations/{VERTEX_LOCATION}/publishers/google/models/{VERTEX_EMBED_MODEL}"
-    inst = {"image": {"bytesBase64Encoded": b64}}
+        print("[embeddings] VERTEX_PROJECT_ID not set; embeddings disabled")
+        _vertex_model = False
+        return
     try:
-        resp = _vertex_client.predict(endpoint=endpoint, instances=[inst], parameters={})
-        pred = resp.predictions[0]
-        if hasattr(pred, 'get'):
-            embed = pred.get('imageEmbedding') or pred.get('embedding')
-        else:
-            embed = pred['imageEmbedding'] if 'imageEmbedding' in pred else pred['embedding']
-        vec = list(map(float, embed))
-        norm = np.linalg.norm(vec) or 1.0
-        vec = [float(x / norm) for x in vec]
+        vertexai.init(project=VERTEX_PROJECT_ID, location=VERTEX_LOCATION)
+        _vertex_model = MultiModalEmbeddingModel.from_pretrained(VERTEX_EMBED_MODEL)
+        print(f"[embeddings] Vertex model loaded: {VERTEX_EMBED_MODEL} project={VERTEX_PROJECT_ID} loc={VERTEX_LOCATION}")
+    except Exception as e:
+        print(f"[embeddings] failed to init model: {e}")
+        _vertex_model = False
+
+def _l2_normalize(vec):
+    n = math.sqrt(sum(x*x for x in vec)) or 1.0
+    return [x / n for x in vec]
+
+def _embed_image_bytes_vertex(jpeg_bytes: bytes):
+    global _suppress_embeddings
+    if _suppress_embeddings:
+        return None
+    if _vertex_model is None:
+        _init_vertex_model()
+    if not _vertex_model or _vertex_model is False:
+        return None
+    try:
+        from vertexai.vision_models import Image as VertexImage  # type: ignore
+        image_obj = VertexImage(image_bytes=jpeg_bytes)
+        # dimension parameter is optional; only pass if not full to maybe save cost
+        kwargs = {"image": image_obj}
+        if VERTEX_EMBED_DIM and VERTEX_EMBED_DIM > 0:
+            kwargs["dimension"] = VERTEX_EMBED_DIM
+        emb = _vertex_model.get_embeddings(**kwargs)
+        vec = list(emb.image_embedding)
+        if not vec:
+            raise ValueError("empty image embedding returned")
+        vec = _l2_normalize(vec)
+        print(f"[embeddings] OK dim={len(vec)}")
         return vec
     except Exception as e:
-        print(f"[embeddings] predict failed: {e}")
+        print(f"[embeddings] embed failed: {e}")
+        _suppress_embeddings = True
         return None
 
 async def head_exists(session: aiohttp.ClientSession, url: str) -> bool:
@@ -227,14 +255,7 @@ async def process_set_to_supabase_noapi(
     supabase: Client, set_name: str, api_set_id: str, csv_path: str
 ):
     print(f"\n==== Onboarding (no API): {set_name} ({api_set_id}) ====")
-    if VERTEX_PROJECT_ID:
-        # Ensure Vertex initialized once early
-        _init_vertex()
-        if _vertex_client is False:
-            print("[embeddings] Vertex init failed (see earlier error) — embeddings will be skipped.")
-        print(f"Embedding config: project={VERTEX_PROJECT_ID} location={VERTEX_LOCATION} model={VERTEX_EMBED_MODEL}")
-    else:
-        print("Embedding config: VERTEX_PROJECT_ID missing -> embeddings will be skipped.")
+    print(f"Embedding (Vertex) config: model={VERTEX_EMBED_MODEL} dim={VERTEX_EMBED_DIM} project={VERTEX_PROJECT_ID or 'NONE'}")
     df = pd.read_csv(csv_path)
 
     # canonicalize variants from CSV subtype
@@ -323,19 +344,18 @@ async def process_set_to_supabase_noapi(
                     hashes = compute_model_hashes_from_file(tmp_path)
                     # Embedding: reuse existing bytes but compress to JPEG for size (optional)
                     emb_vec = None
-                    if VERTEX_PROJECT_ID:
-                        try:
-                            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                            jbuf = io.BytesIO(); pil_img.save(jbuf, format="JPEG", quality=90)
-                            embed_attempts += 1
-                            emb_vec = _embed_image_bytes(jbuf.getvalue())
-                            if emb_vec:
-                                embed_success += 1
-                            else:
-                                embed_fail += 1
-                        except Exception as e:
+                    try:
+                        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                        jbuf = io.BytesIO(); pil_img.save(jbuf, format="JPEG", quality=90)
+                        embed_attempts += 1
+                        emb_vec = _embed_image_bytes_vertex(jbuf.getvalue())
+                        if emb_vec:
+                            embed_success += 1
+                        else:
                             embed_fail += 1
-                            print(f"[embeddings] error for {card_id} {variant}: {e}")
+                    except Exception as e:
+                        embed_fail += 1
+                        print(f"[embeddings] error for {card_id} {variant}: {e}")
                 finally:
                     if tmp_path and os.path.exists(tmp_path):
                         try: os.remove(tmp_path)

@@ -1,6 +1,6 @@
-import os, io, ssl, base64, json, certifi, urllib.request
+import os, io, ssl, base64, json, certifi, urllib.request, math
 from typing import List, Optional, Tuple, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
@@ -30,6 +30,23 @@ SET_FILTER     = os.getenv("SET_FILTER") or None
 CUTOFF         = int(os.getenv("CUTOFF", "18"))
 TOPK_DEFAULT   = int(os.getenv("TOPK", "5"))
 
+# Embedding configuration (Vertex multimodal embedding model)
+EMBEDDINGS_COLUMN = os.getenv("EMBEDDINGS_COLUMN", "embedding_vec")
+VERTEX_EMBED_MODEL = os.getenv("VERTEX_EMBED_MODEL", "multimodalembedding@001").strip()
+VERTEX_PROJECT_ID = os.getenv("VERTEX_PROJECT_ID", "cardconnect-ethandessner").strip()
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1").strip()
+VERTEX_EMBED_DIM = int(os.getenv("VERTEX_EMBED_DIM", "1408"))
+USE_EMBEDDINGS = os.getenv("USE_EMBEDDINGS", "1").strip() not in ("0", "false", "False")
+_vertex_model = None  # lazy-loaded model handle
+EMBED_SIM_THRESHOLD = float(os.getenv("EMBED_SIM_THRESHOLD", "0.80"))  # similarity >= threshold => confident
+EMBED_DISPLAY_DIMS = int(os.getenv("EMBED_DISPLAY_DIMS", "16"))  # number of dims to send/display for query embedding
+PURE_EMBED_MODE = os.getenv("PURE_EMBED_MODE", "1").strip() in ("1", "true", "True")  # if true, ignore all hash columns
+EMBED_USE_SEGMENTATION = os.getenv("EMBED_USE_SEGMENTATION", "1").strip() not in ("0","false","False")
+EMBED_TRY_FULL_FRAME = os.getenv("EMBED_TRY_FULL_FRAME", "1").strip() not in ("0","false","False")  # if true, also compute full-frame embedding and choose better
+_PCA_READY = False
+_EMB_MEAN = None
+_PCA_W = None  #  (d x 2) matrix for projection
+
 # Pokémon card size/aspect (≈63x88mm)
 CARD_W, CARD_H = 672, 936
 ASPECT_MIN, ASPECT_MAX = 1.30, 1.52
@@ -50,10 +67,11 @@ class CardRow:
     ext_number: str
     subtype_name: str
     image_path: str
-    avg: List[imagehash.ImageHash]
-    wh:  List[imagehash.ImageHash]
-    ph:  List[imagehash.ImageHash]
-    dh:  List[imagehash.ImageHash]
+    avg: List[imagehash.ImageHash] = field(default_factory=list)
+    wh:  List[imagehash.ImageHash] = field(default_factory=list)
+    ph:  List[imagehash.ImageHash] = field(default_factory=list)
+    dh:  List[imagehash.ImageHash] = field(default_factory=list)
+    embedding: Optional[List[float]] = None  # normalized embedding vector
 
 def _hx(s: str) -> imagehash.ImageHash:
     # Accept raw hex or ImageHash("...") forms
@@ -269,22 +287,28 @@ def score_to_confidence(score: Optional[int], cutoff: int) -> float:
 
 
 def fetch_all_cards():
-    """Load rows + parse their 16 hashes into ImageHash objects."""
+    """Load rows + parse hashes + optional embedding vectors from Supabase."""
     global CARDS
     CARDS = []
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("Supabase env missing; skipping preload.")
         return
 
+    embed_col = EMBEDDINGS_COLUMN
     page, off = 1000, 0
-    while True:
-        q = SB.table(TABLE).select(
-            "card_id,name,set_name,ext_number,subtype_name,image_path,"
-            "avghashes,avghashesmir,avghashesud,avghashesudmir,"
-            "whashes,whashesmir,whashesud,whashesudmir,"
-            "phashes,phashesmir,phashesud,phashesudmir,"
+    if PURE_EMBED_MODE:
+        base_select = "card_id,name,set_name,ext_number,subtype_name,image_path"
+    else:
+        base_select = (
+            "card_id,name,set_name,ext_number,subtype_name,image_path," \
+            "avghashes,avghashesmir,avghashesud,avghashesudmir," \
+            "whashes,whashesmir,whashesud,whashesudmir," \
+            "phashes,phashesmir,phashesud,phashesudmir," \
             "dhashes,dhashesmir,dhashesud,dhashesudmir"
-        ).range(off, off+page-1)
+        )
+    select_clause = base_select + (f",{embed_col}" if USE_EMBEDDINGS else "")
+    while True:
+        q = SB.table(TABLE).select(select_clause).range(off, off+page-1)
         if SET_FILTER:
             q = q.eq("set_name", SET_FILTER)
         resp = q.execute()
@@ -293,25 +317,151 @@ def fetch_all_cards():
             break
         for r in data:
             try:
-                CARDS.append(CardRow(
-                    card_id=r["card_id"],
-                    name=r["name"],
-                    set_name=r["set_name"],
-                    ext_number=r["ext_number"],
-                    subtype_name=r["subtype_name"],
-                    image_path=r["image_path"],
-                    avg=[_hx(r["avghashes"]), _hx(r["avghashesmir"]), _hx(r["avghashesud"]), _hx(r["avghashesudmir"])],
-                    wh =[ _hx(r["whashes"]),  _hx(r["whashesmir"]),  _hx(r["whashesud"]),  _hx(r["whashesudmir"])],
-                    ph =[ _hx(r["phashes"]),  _hx(r["phashesmir"]),  _hx(r["phashesud"]),  _hx(r["phashesudmir"])],
-                    dh =[ _hx(r["dhashes"]),  _hx(r["dhashesmir"]),  _hx(r["dhashesud"]),  _hx(r["dhashesudmir"])],
-                ))
+                emb_vec = None
+                if USE_EMBEDDINGS and embed_col in r and r[embed_col] is not None:
+                    rawv = r[embed_col]
+                    if isinstance(rawv, str):
+                        try:
+                            rawv = json.loads(rawv)
+                        except Exception:
+                            rawv = None
+                    if isinstance(rawv, (list, tuple)):
+                        arr = np.array(rawv, dtype=float)
+                        n = np.linalg.norm(arr) or 1.0
+                        emb_vec = (arr / n).astype(float).tolist()
+                if PURE_EMBED_MODE:
+                    CARDS.append(CardRow(
+                        card_id=r["card_id"], name=r["name"], set_name=r["set_name"],
+                        ext_number=r["ext_number"], subtype_name=r["subtype_name"], image_path=r["image_path"],
+                        embedding=emb_vec
+                    ))
+                else:
+                    CARDS.append(CardRow(
+                        card_id=r["card_id"],
+                        name=r["name"],
+                        set_name=r["set_name"],
+                        ext_number=r["ext_number"],
+                        subtype_name=r["subtype_name"],
+                        image_path=r["image_path"],
+                        avg=[_hx(r["avghashes"]), _hx(r["avghashesmir"]), _hx(r["avghashesud"]), _hx(r["avghashesudmir"])],
+                        wh =[ _hx(r["whashes"]),  _hx(r["whashesmir"]),  _hx(r["whashesud"]),  _hx(r["whashesudmir"])],
+                        ph =[ _hx(r["phashes"]),  _hx(r["phashesmir"]),  _hx(r["phashesud"]),  _hx(r["phashesudmir"])],
+                        dh =[ _hx(r["dhashes"]),  _hx(r["dhashesmir"]),  _hx(r["dhashesud"]),  _hx(r["dhashesudmir"])],
+                        embedding=emb_vec,
+                    ))
             except Exception as e:
-                # Skip malformed rows
                 print("row skip:", e)
         off += page
         if len(data) < page:
             break
-    print(f"Loaded {len(CARDS)} cards from Supabase ({TABLE}).")
+    have = sum(1 for c in CARDS if c.embedding)
+    print(f"Loaded {len(CARDS)} cards from Supabase ({TABLE}); {have} with embeddings.")
+    if have >= 5:
+        _build_pca_projection()
+    else:
+        print("[pca] Not enough embeddings for PCA visualization (need >=5)")
+
+def _build_pca_projection():
+    """Compute a quick 2D PCA projection of current embeddings for monitor plotting."""
+    global _PCA_READY, _EMB_MEAN, _PCA_W
+    emb_list = [c.embedding for c in CARDS if c.embedding]
+    if len(emb_list) < 5:
+        _PCA_READY = False
+        return
+    X = np.array(emb_list, dtype=float)
+    _EMB_MEAN = X.mean(axis=0)
+    Xc = X - _EMB_MEAN
+    # covariance via SVD for speed with possibly high dim vectors
+    try:
+        U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+        _PCA_W = Vt[:2].T  # d x 2
+        _PCA_READY = True
+        print(f"[pca] Projection ready (embeddings={len(emb_list)})")
+    except Exception as e:
+        print(f"[pca] SVD failed: {e}")
+        _PCA_READY = False
+
+def _pca_project(vec: List[float]):
+    if not _PCA_READY or _PCA_W is None or _EMB_MEAN is None:
+        return None
+    v = np.array(vec, dtype=float) - _EMB_MEAN
+    pt = v @ _PCA_W  # 2D
+    return pt.tolist()
+
+# ---------------- Embedding Runtime (Vertex) -----------------
+def _init_vertex_model():
+    global _vertex_model
+    if _vertex_model is not None:
+        return
+    if not USE_EMBEDDINGS:
+        _vertex_model = False
+        return
+    if not VERTEX_PROJECT_ID:
+        print("[embed] VERTEX_PROJECT_ID missing; disabling embeddings")
+        _vertex_model = False
+        return
+    try:
+        import vertexai  # type: ignore
+        from vertexai.vision_models import MultiModalEmbeddingModel  # type: ignore
+        vertexai.init(project=VERTEX_PROJECT_ID, location=VERTEX_LOCATION)
+        _vertex_model = MultiModalEmbeddingModel.from_pretrained(VERTEX_EMBED_MODEL)
+        print(f"[embed] Loaded model {VERTEX_EMBED_MODEL} @ {VERTEX_PROJECT_ID}/{VERTEX_LOCATION}")
+    except Exception as e:
+        print(f"[embed] init failed: {e}")
+        _vertex_model = False
+
+def _l2(v: List[float]):
+    n = math.sqrt(sum(x*x for x in v)) or 1.0
+    return [x/n for x in v]
+
+def _embed_pil(img: Image.Image) -> Optional[List[float]]:
+    if not USE_EMBEDDINGS:
+        return None
+    if _vertex_model is None:
+        _init_vertex_model()
+    if not _vertex_model or _vertex_model is False:
+        return None
+    try:
+        from vertexai.vision_models import Image as VImage  # type: ignore
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        vimg = VImage(image_bytes=buf.getvalue())
+        params = {"image": vimg}
+        if VERTEX_EMBED_DIM:
+            params["dimension"] = VERTEX_EMBED_DIM
+        out = _vertex_model.get_embeddings(**params)
+        vec = list(out.image_embedding)
+        if not vec:
+            return None
+        return _l2(vec)
+    except Exception as e:
+        print(f"[embed] fail: {e}")
+        return None
+
+def _nearest_by_embedding(query_vec: List[float], top_k: int) -> List[Tuple[float, CardRow]]:
+    q = np.array(query_vec, dtype=float)
+    # Cosine distance since vectors are normalized: dist = 1 - dot
+    scored: List[Tuple[float, CardRow]] = []
+    for c in CARDS:
+        if not c.embedding:
+            continue
+        v = np.array(c.embedding, dtype=float)
+        sim = float(np.dot(q, v))  # cosine similarity
+        # higher is better; we'll sort descending
+        scored.append((sim, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:max(1, top_k)]
+
+def _pca_all_points():
+    if not _PCA_READY:
+        return []
+    pts = []
+    for c in CARDS:
+        if c.embedding:
+            proj = _pca_project(c.embedding)
+            if proj:
+                pts.append(proj)
+    return pts
 
 # ---------- API ----------
 @app.on_event("startup")
@@ -356,11 +506,18 @@ def monitor():
       <div>Best: <span id="best">–</span></div>
       <div>Score: <code id="score">–</code></div>
       <div>Confidence: <code id="conf">–</code></div>
-      <div>Cutoff: <code id="cutoff">–</code></div>
+            <div>Cutoff: <code id="cutoff">–</code>  |  Sim thresh: <code id="simthresh">–</code></div>
       <div>Corners: <code id="corners">–</code></div>
+    <div style="height:8px"></div>
+    <div>Embedding dims: <code id="embdims">–</code></div>
+    <div style="font-size:12px; line-height:1.3; max-width:320px; word-break:break-all;">q[0..]: <code id="embpreview">–</code></div>
       <div style="height:12px"></div>
       <div>Top:</div>
       <ol id="top"></ol>
+            <div style="height:16px"></div>
+            <div>Embedding space (PCA 2D):</div>
+            <canvas id="pcacanvas" width="300" height="300" style="border:1px solid #333; background:#111; border-radius:6px"></canvas>
+            <div id="simlist" style="margin-top:8px; font-size:12px; line-height:1.3"></div>
     </div>
   </div>
 <script>
@@ -377,7 +534,65 @@ def monitor():
   const $conf = document.getElementById('conf');
   const $cutoff = document.getElementById('cutoff');
   const $corners = document.getElementById('corners');
-  const $top = document.getElementById('top');
+    const $embdims = document.getElementById('embdims');
+    const $embpreview = document.getElementById('embpreview');
+    const $top = document.getElementById('top');
+    const $simthresh = document.getElementById('simthresh');
+    const $canvas = document.getElementById('pcacanvas');
+    const ctx = $canvas.getContext('2d');
+    const $simlist = document.getElementById('simlist');
+
+    function drawPCA(payload){
+        if(!payload || !payload.pca){ ctx.clearRect(0,0,$canvas.width,$canvas.height); return; }
+        const {points, query, neighbors} = payload.pca;
+        ctx.clearRect(0,0,$canvas.width,$canvas.height);
+        if(!points || points.length === 0) return;
+        // compute bounds
+        let xs = [], ys = [];
+        points.forEach(p=>{ xs.push(p[0]); ys.push(p[1]); });
+        if(query) { xs.push(query[0]); ys.push(query[1]); }
+        const minX = Math.min(...xs), maxX = Math.max(...xs);
+        const minY = Math.min(...ys), maxY = Math.max(...ys);
+        const pad = 0.08; // 8% padding
+        const dx = (maxX - minX) || 1; const dy = (maxY - minY) || 1;
+        function toPix(pt){
+            return [
+                ( (pt[0]-minX)/dx * (1-pad*2) + pad) * $canvas.width,
+                (1 - (pt[1]-minY)/dy * (1-pad*2) - pad) * $canvas.height
+            ];
+        }
+        // plot background points (all embeddings)
+        ctx.fillStyle = '#444';
+        points.forEach(pt=>{
+            const [x,y] = toPix(pt);
+            ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill();
+        });
+        // neighbors
+        if(neighbors){
+            ctx.fillStyle = '#1e88e5';
+            neighbors.forEach(pt=>{ const [x,y]=toPix(pt); ctx.beginPath(); ctx.arc(x,y,4,0,Math.PI*2); ctx.fill(); });
+        }
+        // query point
+        if(query){
+            const [xq,yq] = toPix(query);
+            ctx.fillStyle = '#ffcc00';
+            ctx.beginPath(); ctx.arc(xq,yq,6,0,Math.PI*2); ctx.fill();
+            ctx.strokeStyle = '#fff'; ctx.lineWidth=2; ctx.stroke();
+        }
+    }
+
+    function renderSims(top){
+        if(!top){ $simlist.innerHTML=''; return; }
+        $simlist.innerHTML = top.map(t=>{
+            const pct = (t.similarity*100).toFixed(1);
+            return `<div style="display:flex;align-items:center;gap:6px;">\n`+
+                         `<div style="flex:0 0 42px; color:#aaa;">${pct}%</div>`+
+                         `<div style="flex:1; background:#222; height:6px; border-radius:4px; overflow:hidden;">`+
+                         `<div style="width:${pct}%; height:100%; background:#4caf50"></div></div>`+
+                         `<div style="flex:0 0 auto; color:#888; font-size:10px;">${t.card_id}</div>`+
+                         `</div>`;
+        }).join('');
+    }
 
   ws.onopen = () => { $status.textContent = 'connected'; };
   ws.onclose = () => { $status.textContent = 'disconnected'; };
@@ -390,21 +605,37 @@ def monitor():
     }
     $cutoff.textContent = msg.cutoff ?? '-';
     $corners.textContent = JSON.stringify(msg.corners ?? null);
-    if (msg.best) {
-      $best.textContent = `${msg.best.name} • ${msg.best.set_name} • ${msg.best.ext_number} • ${msg.best.subtype_name}`;
-      $score.textContent = String(msg.best.score);
-      $conf.textContent = ((msg.confidence ?? 0)*100).toFixed(0) + '%';
-    } else {
-      $best.textContent = '–';
-      $score.textContent = '–';
-      $conf.textContent = '–';
-    }
+    $simthresh.textContent = msg.similarity_threshold ?? '-';
+        if (msg.query_embedding) {
+            $embdims.textContent = msg.query_embedding.dim || '-';
+            $embpreview.textContent = (msg.query_embedding.first || []).map(v=>v.toFixed(4)).join(', ');
+        } else {
+            $embdims.textContent = '–';
+            $embpreview.textContent = '–';
+        }
+        if (msg.best) {
+            // Confident match
+            $best.textContent = `${msg.best.name} • ${msg.best.set_name} • ${msg.best.ext_number} • ${msg.best.subtype_name}`;
+            $score.textContent = String(msg.best.score);
+            $conf.textContent = ((msg.confidence ?? 0)*100).toFixed(0) + '%';
+        } else if (msg.raw_best) {
+            const simPct = ((msg.raw_best.similarity||0)*100).toFixed(1);
+            $best.textContent = `No confident match (top ${simPct}% sim)`;
+            $score.textContent = String(msg.raw_best.score ?? '–');
+            $conf.textContent = simPct + '%';
+        } else {
+            $best.textContent = '–';
+            $score.textContent = '–';
+            $conf.textContent = '–';
+        }
     $top.innerHTML = '';
-    (msg.top || []).forEach((t) => {
+        renderSims(msg.top || []);
+        (msg.top || []).forEach((t) => {
       const li = document.createElement('li');
       li.textContent = `${t.score}  ${t.card_id}`;
       $top.appendChild(li);
     });
+        drawPCA(msg);
   };
 </script>
 </body>
@@ -431,83 +662,169 @@ async def match(
     file: UploadFile = File(...),
     strategy: str = Form("auto"),         # always auto-segment
     top_k: int = Form(TOPK_DEFAULT),
-    cutoff: int = Form(CUTOFF),
+    cutoff: int = Form(CUTOFF),            # kept for backward compat; not used in embedding mode
 ):
     try:
         raw = await file.read()
         img_pil = Image.open(io.BytesIO(raw))
         img_pil = ImageOps.exif_transpose(img_pil).convert("RGB")
 
-        # Segment and warp
+        # Original BGR frame
         bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-        warped, overlay, edges, thr, quad = segment_card_like_model(bgr)
 
-        if warped is None:
-            # Send to monitor
-            montage_jpg = _make_montage_jpg(bgr, overlay, edges, thr, None, None)
-            await broadcast_debug({
-                "jpg_b64": montage_jpg,
-                "corners": None,
+        # Optional segmentation
+        warped = None; overlay = bgr.copy(); edges = np.zeros_like(bgr); thr = np.zeros_like(bgr); quad = None
+        if EMBED_USE_SEGMENTATION:
+            warped, overlay, edges, thr, quad = segment_card_like_model(bgr)
+        # If segmentation disabled or failed (warped is blank or mostly zeros), we'll rely on full-frame path.
+        use_seg = False
+        if EMBED_USE_SEGMENTATION and warped is not None:
+            # Heuristic: check if warped has variance (not pure blank from fail case)
+            if np.var(warped) > 5.0:  # arbitrary small threshold
+                use_seg = True
+
+        # Prepare candidate images for embedding
+        seg_pil = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)) if use_seg else None
+        full_pil = img_pil  # original (already RGB)
+        # Optionally resize full frame to card aspect & size for consistency
+        if EMBED_TRY_FULL_FRAME:
+            full_pil_resized = full_pil.resize((CARD_W, CARD_H), Image.BILINEAR)
+        else:
+            full_pil_resized = None
+
+        # Embedding-only path
+        best = None
+        top = []
+        best_score = None  # pseudo "distance" = 1 - similarity
+        confidence = 0.0
+        is_confident = False
+
+        chosen_mode = None
+        qvec = None
+        scored = []
+        alt_info = {}
+        if USE_EMBEDDINGS:
+            seg_vec = _embed_pil(seg_pil) if seg_pil else None
+            full_vec = _embed_pil(full_pil_resized) if full_pil_resized else None
+            # Decide which vector to prefer:
+            # Strategy: if both exist run quick top-1 similarity for each and choose higher; else fallback to whichever exists.
+            best_seg = None; best_full = None
+            if seg_vec:
+                seg_scored_tmp = _nearest_by_embedding(seg_vec, 1)
+                if seg_scored_tmp:
+                    best_seg = float(seg_scored_tmp[0][0])
+            if full_vec:
+                full_scored_tmp = _nearest_by_embedding(full_vec, 1)
+                if full_scored_tmp:
+                    best_full = float(full_scored_tmp[0][0])
+            # Selection logic
+            if seg_vec and full_vec:
+                if best_full is not None and best_seg is not None and best_full > best_seg + 0.005:  # small margin
+                    qvec = full_vec; chosen_mode = "full"
+                else:
+                    qvec = seg_vec; chosen_mode = "seg"
+            elif seg_vec:
+                qvec = seg_vec; chosen_mode = "seg"
+            elif full_vec:
+                qvec = full_vec; chosen_mode = "full"
+            else:
+                qvec = None
+            if qvec:
+                scored = _nearest_by_embedding(qvec, top_k)
+            alt_info = {
+                "variant_scores": {
+                    "seg_top1": best_seg,
+                    "full_top1": best_full
+                },
+                "variant_used": chosen_mode,
+                "segmentation_used": bool(use_seg)
+            }
+        if qvec:
+            top = [{
+                "similarity": float(sim),
+                "score": float(1.0 - sim),
+                "card_id": r.card_id,
+                "name": r.name,
+                "set_name": r.set_name,
+                "ext_number": r.ext_number,
+                "subtype_name": r.subtype_name,
+                "image_path": r.image_path,
+            } for sim, r in scored]
+            top = [{
+                **t,
+                "mode": chosen_mode
+            } for t in top]
+            best = top[0] if top else None
+            if best:
+                best_score = best["score"]
+                confidence = max(0.0, min(1.0, best["similarity"]))
+                is_confident = best["similarity"] >= EMBED_SIM_THRESHOLD
+        else:
+            # No embedding produced; return empty result (no hash fallback by design)
+            return {
+                "match": None,
                 "best": None,
                 "top": [],
-                "cutoff": cutoff,
+                "best_score": None,
+                "is_confident": False,
                 "confidence": 0.0,
-            })
-            return {
-                "match": None, "best": None, "top": [],
-                "cutoff": cutoff, "count": len(CARDS),
-                "error": "no_card_detected"
+                "cutoff": cutoff,
+                "count": len(CARDS),
+                "mode": "embedding",
+                "error": "embedding_unavailable"
             }
-
-        # Hash the warped card using the SAME normalization as DB
-        scan_img = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
-        cap_hashes = compute_hashes_pil(scan_img)  # compute_hashes_pil calls prepare_card_for_hash
-
-        # Score against all rows (max-of-mins across orientations/methods)
-        scored = []
-        for r in CARDS:
-            s = score_max_of_mins(cap_hashes, r)
-            scored.append((s, r))
-        scored.sort(key=lambda x: x[0])
-
-        top = [{
-            "score": s,
-            "card_id": r.card_id,
-            "name": r.name,
-            "set_name": r.set_name,
-            "ext_number": r.ext_number,
-            "subtype_name": r.subtype_name,
-            "image_path": r.image_path,
-        } for s, r in scored[:max(1, top_k)]]
-
-        best = top[0] if top else None
-        best_score = best["score"] if best else None
-        is_confident = bool(best and best_score is not None and best_score < cutoff)
-        confidence = score_to_confidence(best_score, cutoff) if best_score is not None else 0.0
 
         # Push live montage to /monitor
         montage_jpg = _make_montage_jpg(bgr, overlay, edges, thr, warped, best)
-        await broadcast_debug({
+        debug_payload = {
             "jpg_b64": montage_jpg,
             "corners": quad.tolist() if quad is not None else None,
-            "best": best,
+            # Only surface a 'best' if confident; always send raw_best for debugging
+            "best": (best if is_confident else None),
+            "raw_best": best,
             "top": top[:5],
             "cutoff": cutoff,
             "confidence": confidence,
-        })
+            "similarity_threshold": EMBED_SIM_THRESHOLD,
+            "is_confident": is_confident,
+            **({"query_embedding": {
+                "dim": len(qvec),
+                "first": qvec[:EMBED_DISPLAY_DIMS]
+            }} if qvec else {}),
+            **({"pca": {
+                "points": _pca_all_points(),
+                "query": (_pca_project(qvec) if qvec else None),
+                "neighbors": [ _pca_project(c.embedding) for c in [s[1] for s in scored[:5]] if _PCA_READY and c.embedding ]
+            }} if qvec and _PCA_READY else {})
+        }
+        debug_payload.update(alt_info)
+        await broadcast_debug(debug_payload)
 
         # Response for the app
-        return {
+        response_payload = {
             "match": (best if is_confident else None),
             "best": best,
             "top": top,
-            "best_score": best_score,
+            "best_score": best_score,           # distance-style (lower better)
+            "best_similarity": (best.get("similarity") if best else None),
             "is_confident": is_confident,
-            "confidence": confidence,
-            "cutoff": cutoff,
+            "confidence": confidence,           # same as best_similarity capped 0..1
+            "similarity_threshold": EMBED_SIM_THRESHOLD,
+            "cutoff": cutoff,                   # legacy field (unused in embedding)
             "count": len(CARDS),
-            "mode": "auto",
+            "mode": "embedding",
+            **({"query_embedding": {
+                "dim": len(qvec),
+                "first": qvec[:EMBED_DISPLAY_DIMS]
+            }} if qvec else {}),
+            **({"pca": {
+                "points": _pca_all_points(),
+                "query": (_pca_project(qvec) if qvec else None),
+                "neighbors": [ _pca_project(c.embedding) for c in [s[1] for s in scored[:top_k]] if _PCA_READY and c.embedding ]
+            }} if qvec and _PCA_READY else {})
         }
+        response_payload.update(alt_info)
+        return response_payload
 
     except Exception as e:
         # Return 200 with an error payload so the app can show a toast instead of just failing

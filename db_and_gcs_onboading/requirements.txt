@@ -1,0 +1,11 @@
+pandas
+pillow
+ImageHash
+opencv-python-headless
+numpy
+supabase
+python-dotenv
+certifi
+aiohttp
+aiofiles
+google-cloud-aiplatform

@@ -13,6 +13,7 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'dart:ui' show FontFeature;
 import 'home_tab.dart';
 import 'camera_tab.dart';
+import 'camera_alt.dart';
 import 'collection_tab.dart';
 import 'user_tab.dart';
 

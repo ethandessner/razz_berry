@@ -57,37 +57,37 @@ class ResultBanner extends StatelessWidget {
                 ],
               ),
             ],
-            if (top.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Text('Top candidates', style: Theme.of(context).textTheme.labelLarge),
-              const SizedBox(height: 6),
-              SizedBox(
-                height: 120,
-                child: ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  itemCount: top.length,
-                  separatorBuilder: (_, __) => const SizedBox(width: 10),
-                  itemBuilder: (_, i) {
-                    final t = top[i];
-                    final url = _gcsToDownloadUrl(
-                      (t['signed_image_url'] ?? t['image_path'] ?? '') as String,
-                    );
-                    return Column(
-                      children: [
-                        Thumb(url: url, size: 84),
-                        const SizedBox(height: 4),
-                        Text(
-                          'score ${t['score']}',
-                          style: const TextStyle(
-                            fontFeatures: [FontFeature.tabularFigures()],
-                          ),
-                        ),
-                      ],
-                    );
-                  },
-                ),
-              ),
-            ],
+            // if (top.isNotEmpty) ...[
+            //   const SizedBox(height: 12),
+            //   Text('Top candidates', style: Theme.of(context).textTheme.labelLarge),
+            //   const SizedBox(height: 6),
+            //   SizedBox(
+            //     height: 120,
+            //     child: ListView.separated(
+            //       scrollDirection: Axis.horizontal,
+            //       itemCount: top.length,
+            //       separatorBuilder: (_, __) => const SizedBox(width: 10),
+            //       itemBuilder: (_, i) {
+            //         final t = top[i];
+            //         final url = _gcsToDownloadUrl(
+            //           (t['signed_image_url'] ?? t['image_path'] ?? '') as String,
+            //         );
+            //         return Column(
+            //           children: [
+            //             Thumb(url: url, size: 84),
+            //             const SizedBox(height: 4),
+            //             Text(
+            //               'score ${t['score']}',
+            //               style: const TextStyle(
+            //                 fontFeatures: [FontFeature.tabularFigures()],
+            //               ),
+            //             ),
+            //           ],
+            //         );
+            //       },
+            //     ),
+            //   ),
+            // ],
           ],
         ),
       ),

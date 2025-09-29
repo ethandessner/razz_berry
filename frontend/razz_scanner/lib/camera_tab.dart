@@ -66,9 +66,19 @@ class _CameraTabState extends State<CameraTab> {
     return Column(
       children: [
         Expanded(
-          child: isReady
-              ? CameraPreview(controller!)
-              : const Center(child: CircularProgressIndicator()),
+          child: SafeArea(
+            top: true,
+            bottom: false,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 12.0, left: 12, right: 12),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: isReady
+                    ? CameraPreview(controller!)
+                    : const Center(child: CircularProgressIndicator()),
+              ),
+            ),
+          ),
         ),
         Padding(
           padding: const EdgeInsets.only(bottom: 24, top: 8),

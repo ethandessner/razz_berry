@@ -8,3 +8,4 @@ numpy
 scikit-learn
 httpx
 google-cloud-aiplatform
+google-cloud-storage
